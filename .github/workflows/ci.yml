@@ -3,32 +3,8 @@ name: CI
 on:
   push:
     branches: [main, develop]
-    paths:
-      - 'components/espectre/**'
-      - 'micro-espectre/src/**'
-      - 'micro-espectre/tests/**'
-      - 'micro-espectre/requirements.txt'
-      - 'test/**'
-      - 'examples/*.yaml'
-      - '.github/workflows/**'
-      - '.github/scripts/**'
-      - '*.md'
-      - 'micro-espectre/*.md'
-      - 'docs/**'
   pull_request:
     branches: [develop]
-    paths:
-      - 'components/espectre/**'
-      - 'micro-espectre/src/**'
-      - 'micro-espectre/tests/**'
-      - 'micro-espectre/requirements.txt'
-      - 'test/**'
-      - 'examples/*.yaml'
-      - '.github/workflows/**'
-      - '.github/scripts/**'
-      - '*.md'
-      - 'micro-espectre/*.md'
-      - 'docs/**'
   workflow_dispatch:  # Manual trigger to warm up cache
 
 # Permissions for GitHub Pages deployment
@@ -43,8 +19,95 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect-push-origin:
+    name: Detect Push Origin
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.detect.outputs.run_ci }}
+      is_pr_push: ${{ steps.detect.outputs.is_pr_push }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Detect if push commit belongs to merged PR
+        id: detect
+        uses: actions/github-script@v7
+        env:
+          CLA_AUTOMATION_ACTORS: contributors-assistant[bot]
+        with:
+          script: |
+            // Default: run CI unless we prove this is a merged-PR push to develop.
+            if (context.eventName !== "push" || context.ref !== "refs/heads/develop") {
+              core.setOutput("run_ci", "true");
+              core.setOutput("is_pr_push", "false");
+              core.info("Not a push on develop. CI will run.");
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.sha;
+            const commits = context.payload.commits || [];
+            const senderLogin = context.payload.sender?.login || "";
+            const automationActors = new Set(
+              (process.env.CLA_AUTOMATION_ACTORS || "")
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+            );
+            const isClaAutomationActor = automationActors.has(context.actor) || automationActors.has(senderLogin);
+
+            // Skip full CI for CLA ledger-only commits written by CLA automation.
+            if (commits.length > 0) {
+              const touchedFiles = new Set();
+              for (const commit of commits) {
+                for (const file of commit.added || []) touchedFiles.add(file);
+                for (const file of commit.modified || []) touchedFiles.add(file);
+                for (const file of commit.removed || []) touchedFiles.add(file);
+              }
+              const onlyClaSignatureFile =
+                touchedFiles.size > 0 &&
+                [...touchedFiles].every((file) => file === ".github/cla-signatures.json");
+
+              if (onlyClaSignatureFile && isClaAutomationActor) {
+                core.setOutput("run_ci", "false");
+                core.setOutput("is_pr_push", "false");
+                core.info(`Detected CLA signatures-only push by automation actor (${context.actor || senderLogin}). Skipping heavy CI.`);
+                return;
+              }
+              if (onlyClaSignatureFile) {
+                core.info("CLA signatures-only push detected, but actor is not allowlisted for automation skip. CI will run.");
+              }
+            }
+
+            const response = await github.request("GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls", {
+              owner,
+              repo,
+              commit_sha: sha,
+              mediaType: { previews: ["groot"] }
+            });
+
+            const relatedMergedPr = response.data.find((pr) =>
+              pr &&
+              pr.merged_at &&
+              pr.base &&
+              pr.base.ref === "develop"
+            );
+
+            const isPrPush = Boolean(relatedMergedPr);
+            core.setOutput("is_pr_push", isPrPush ? "true" : "false");
+            core.setOutput("run_ci", isPrPush ? "false" : "true");
+
+            if (isPrPush) {
+              core.info(`Detected merged PR push (PR #${relatedMergedPr.number}). Skipping duplicate CI on develop push.`);
+            } else {
+              core.info("No merged PR associated with this push commit. Treating as direct push; CI will run.");
+            }
+
   build-docs:
     name: Build Documentation
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -118,6 +181,8 @@ jobs:
 
   test-cpp:
     name: C++ Unit Tests
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -158,6 +223,8 @@ jobs:
 
   test-python:
     name: Python Unit Tests (micro-espectre)
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -189,6 +256,8 @@ jobs:
   # Pre-cache job: downloads toolchain once, shared by all build jobs
   setup-cache:
     name: Setup Build Cache
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     outputs:
       cache-hit: ${{ steps.cache.outputs.cache-hit }}
@@ -221,7 +290,8 @@ jobs:
   build:
     name: ${{ matrix.qemu_chip && 'Smoke Test' || 'Build' }} ${{ matrix.chip }}
     runs-on: ubuntu-latest
-    needs: setup-cache
+    needs: [detect-push-origin, setup-cache]
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     strategy:
       fail-fast: false
       matrix:
